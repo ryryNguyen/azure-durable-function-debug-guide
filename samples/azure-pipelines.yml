@@ -1,0 +1,139 @@
+# Python Function App to Linux on Azure
+# Build a Python function app and deploy it to Azure as a Linux function app.
+# Add steps that analyze code, save build artifacts, deploy, and more:
+# https://docs.microsoft.com/azure/devops/pipelines/languages/python
+
+trigger:
+  - main
+
+variables:
+  # Azure Resource Manager connection created during pipeline creation
+  azureSubscription: 'your-azure-subscription-id'
+  # Agent VM image name
+  vmImageName: 'ubuntu-latest'
+  #   Working Directory
+  workingDirectory: $(System.DefaultWorkingDirectory)
+
+  # ---- UV Configuration ----
+  # These will be set as global environment variables
+  UV_INDEX_SOMESOURCE_USERNAME: VssSessionToken
+  UV_INDEX_SOMESOURCE_PASSWORD: $(System.AccessToken)
+  # UV_KEYRING_PROVIDER: disabled
+  # This environment variable keeps the cache in a predictable location
+  UV_CACHE_DIR: $(Agent.TempDirectory)/cache/uv
+  # Set Python Version
+  python.version: '3.11'
+  ADO_ORG: 'your-azure-devops-organization'
+  ADO_PROJECT: 'your-azure-devops-project'
+  ADO_FEED: 'your-azure-devops-feed'
+  extraIndexUrl: 'https://$(UV_INDEX_SOMESOURCE_PASSWORD)@pkgs.dev.azure.com/$(ADO_ORG)/_packaging/$(ADO_FEED)/pypi/simple'
+
+
+stages:
+  - stage: Build
+    displayName: Build stage
+
+    jobs:
+      - job: Build
+        displayName: Build
+        pool:
+          vmImage: $(vmImageName)
+        steps:
+          - bash: |
+              if [ -f extensions.csproj ]
+              then
+                  dotnet build extensions.csproj --runtime ubuntu.16.04-x64 --output ./bin
+              fi
+            workingDirectory: $(workingDirectory)
+            displayName: 'Build extensions'
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '$(python.version)'
+            displayName: 'Use Python $(python.version)'
+
+          # Install uv
+          - script: pipx install uv
+            displayName: Install uv
+
+          # Setup uv cache directory
+          - task: Cache@2
+            displayName: UV -- Cache uv data
+            inputs:
+              key: '"uv-cache" | "$(Agent.OS)" | "$(python.version)" | uv.lock'
+              restoreKeys: |
+                "uv-cache" | "$(Agent.OS)" | "$(python.version)"
+                "uv-cache" | "$(Agent.OS)"
+                "uv-cache"
+              path: $(UV_CACHE_DIR)
+
+          - script: uv sync --frozen --verbose
+            displayName: UV -- Install dependencies
+            env:
+              UV_INDEX_SOMESOURCE_USERNAME: "$(UV_INDEX_SOMESOURCE_USERNAME)"
+              # This needs to be explicitly mapped as it contains a secret.
+              UV_INDEX_SOMESOURCE_PASSWORD: "$(UV_INDEX_SOMESOURCE_PASSWORD)"
+
+          #              Export the requirements.txt file
+          - bash: |
+              uv export --frozen --no-hashes --no-header --no-annotate --no-emit-project --no-editable  --no-dev  --format requirements.txt > requirements.txt
+            displayName: 'Export requirements.txt'
+
+          # Install dependencies to the target directory
+          - bash: |
+              uv pip install --target="./.python_packages/lib/site-packages" -r ./requirements.txt --extra-index-url  $(extraIndexUrl) --index-strategy unsafe-best-match
+
+            workingDirectory: $(workingDirectory)
+            displayName: 'Install application dependencies'
+            env:
+              # The environment variable used for publishing packages is different
+              UV_INDEX_SOMESOURCE_PASSWORD: "$(UV_INDEX_SOMESOURCE_PASSWORD)"
+
+              UV_KEYRING_PROVIDER: disabled
+
+          - task: CopyFiles@2
+            displayName: 'Stage package files (respect .funcignore)'
+            inputs:
+              SourceFolder: '$(workingDirectory)'
+              Contents: |
+                **/*
+                !.git/**/*
+                !.vscode/**/*
+                !__azurite_db*__.json
+                !__blobstorage__/**/*
+                !__queuestorage__/**/*
+                !local.settings.json
+                !tests/**/*
+                !.venv/**/*
+                !temp/**/*
+                !secrets/**/*
+                !recipes/**/*
+                !staging/**/*
+                !_testing/**/*
+                !tools/**/*
+                !.idea/**/*
+                !.editorconfig
+                !pytest.ini
+                !samples/**/*
+                !*.lock
+                !.azure/**/*
+                !.azuredevops/**/*
+                !cosmosdb/**/*
+              TargetFolder: '$(Build.ArtifactStagingDirectory)/packageSrc'
+              OverWrite: true
+              flattenFolders: false
+
+          - task: ArchiveFiles@2
+            displayName: 'Archive files'
+            inputs:
+              rootFolderOrFile: '$(Build.ArtifactStagingDirectory)/packageSrc'
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip
+              replaceExistingArchive: true
+
+          - publish: $(Build.ArtifactStagingDirectory)
+            artifact: drop
+
+          # Prune the Cache
+          - script: uv cache prune --ci
